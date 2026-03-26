@@ -1,8 +1,6 @@
-# data & model artifacts
-data/
+# model artifacts
 chroma_db/
 bm25_index.pkl
-*.pdf
 
 # python
 __pycache__/
@@ -31,5 +29,5 @@ env/
 Thumbs.db
 
 # old project files (kept for reference during dev)
-alaska-legal/
-Hawaii/
+/alaska-legal/
+/Hawaii/
