@@ -1,0 +1,35 @@
+# data & model artifacts
+data/
+chroma_db/
+bm25_index.pkl
+*.pdf
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# env
+.env
+.venv/
+venv/
+env/
+
+# ide
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# os
+.DS_Store
+Thumbs.db
+
+# old project files (kept for reference during dev)
+alaska-legal/
+Hawaii/
