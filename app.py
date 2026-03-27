@@ -95,6 +95,17 @@ def _display_sources(response: AgentResponse) -> None:
                     with st.expander(label, expanded=False):
                         st.text(chunk.text)
 
+    # show multi-hop reasoning chain if applicable
+    if response.is_multi_hop and response.sub_questions:
+        with st.expander("Multi-hop reasoning chain", expanded=False):
+            for i, (sq, summary) in enumerate(
+                zip(response.sub_questions, response.hop_summaries), 1
+            ):
+                st.markdown(f"**Step {i}:** {sq}")
+                st.markdown(f"> {summary}")
+                if i < len(response.sub_questions):
+                    st.markdown("---")
+
     if response.query_reformulations:
         st.info(
             "Query reformulations: "

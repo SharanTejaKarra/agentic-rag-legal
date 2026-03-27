@@ -42,6 +42,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:8b")
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS = 2048
 MAX_AGENT_ITERATIONS = 3  # self-reflection loop cap
+MAX_MULTI_HOP_STEPS = 3   # max sub-questions for multi-hop decomposition
 
 # ── chunking ───────────────────────────────────────────────────────────
 MAX_CHUNK_TOKENS = 512

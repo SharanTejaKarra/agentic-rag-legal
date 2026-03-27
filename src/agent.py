@@ -7,7 +7,14 @@ and a self-reflection loop that reformulates when needed.
 import logging
 import re
 
-from src.answerer import evaluate_answer_quality, generate_answer, reformulate_query
+from src.answerer import (
+    decompose_query,
+    evaluate_answer_quality,
+    generate_answer,
+    generate_multi_hop_answer,
+    reformulate_query,
+    summarize_hop,
+)
 from src.config import MAX_AGENT_ITERATIONS
 from src.models import AgentResponse, DocumentChunk, RetrievalResult
 from src.retriever import hybrid_retrieve
@@ -128,28 +135,13 @@ def _deduplicate_chunks(chunks: list[DocumentChunk]) -> list[DocumentChunk]:
     return unique
 
 
-def run(query: str, jurisdiction: str | None = None) -> AgentResponse:
-    """Execute the full agentic RAG pipeline.
-
-    Steps: analyze -> retrieve -> answer -> self-reflect (loop) -> return.
-    """
-    query = query.strip()
-    if not query:
-        return AgentResponse(answer="Please provide a question.")
-
-    # -- 1. analyze --
-    analysis = analyze_query(query)
-    logger.info(
-        "Query analysis | intent=%s  jurisdiction=%s  refs=%s",
-        analysis["intent"], analysis["jurisdiction"], analysis["section_refs"],
-    )
-
-    # caller-supplied jurisdiction overrides heuristic detection
-    if jurisdiction is None:
-        jurisdiction = analysis["jurisdiction"]
+def _run_single_hop(
+    query: str, jurisdiction: str | None
+) -> AgentResponse:
+    """Standard single-hop pipeline: retrieve -> answer -> self-reflect loop."""
     reformulations: list[str] = []
 
-    # -- 2. retrieve --
+    # -- retrieve --
     try:
         results: list[RetrievalResult] = hybrid_retrieve(
             query, jurisdiction=jurisdiction
@@ -161,13 +153,12 @@ def run(query: str, jurisdiction: str | None = None) -> AgentResponse:
         )
 
     if not results:
-        logger.warning("No results for initial query")
         return AgentResponse(
             answer="No relevant documents were found for your query. "
                    "Try rephrasing or broadening your search.",
         )
 
-    # -- 3. check relevance (very low scores = probably off-topic) --
+    # low-score reformulation
     top_score = results[0].score
     current_query = query
     all_chunks = [r.chunk for r in results]
@@ -188,11 +179,11 @@ def run(query: str, jurisdiction: str | None = None) -> AgentResponse:
             except Exception as exc:
                 logger.warning("Re-retrieval after reformulation failed: %s", exc)
 
-    # -- 4. generate answer --
-    answer_chunks = all_chunks[: 5]  # feed top chunks to the LLM
+    # generate answer
+    answer_chunks = all_chunks[:5]
     answer = generate_answer(current_query, answer_chunks, jurisdiction)
 
-    # -- 5. self-reflection loop --
+    # self-reflection loop
     iterations = 1
     for i in range(MAX_AGENT_ITERATIONS - 1):
         evaluation = evaluate_answer_quality(current_query, answer, answer_chunks)
@@ -204,13 +195,11 @@ def run(query: str, jurisdiction: str | None = None) -> AgentResponse:
         if evaluation["is_sufficient"]:
             break
 
-        # not good enough -- try reformulating and re-retrieving
         suggested = evaluation.get("suggested_reformulation")
         if suggested:
             reformulations.append(suggested)
             current_query = suggested
         else:
-            # fall back to LLM-based reformulation
             context = f"Previous answer was judged insufficient: {evaluation.get('reason', '')}"
             new_q = reformulate_query(query, context)
             reformulations.append(new_q)
@@ -223,18 +212,14 @@ def run(query: str, jurisdiction: str | None = None) -> AgentResponse:
         except Exception as exc:
             logger.warning("Re-retrieval on iteration %d failed: %s", i + 1, exc)
 
-        # regenerate with the expanded chunk pool
-        answer_chunks = all_chunks[: 7]  # allow a few more chunks on retries
+        answer_chunks = all_chunks[:7]
         answer = generate_answer(current_query, answer_chunks, jurisdiction)
         iterations += 1
     else:
-        # ran out of iterations without a "sufficient" verdict
         logger.info("Hit max iterations (%d) without a sufficient answer", MAX_AGENT_ITERATIONS)
 
-    # -- 6. extract citations --
     citations = _extract_citations(answer, all_chunks)
 
-    # -- 7. build response --
     return AgentResponse(
         answer=answer,
         citations=citations,
@@ -242,3 +227,101 @@ def run(query: str, jurisdiction: str | None = None) -> AgentResponse:
         query_reformulations=reformulations,
         iterations_used=iterations,
     )
+
+
+def _run_multi_hop(
+    query: str,
+    sub_questions: list[str],
+    jurisdiction: str | None,
+) -> AgentResponse:
+    """Multi-hop pipeline: retrieve for each sub-question sequentially,
+    carrying forward context from earlier hops to inform later ones."""
+    all_chunks: list[DocumentChunk] = []
+    all_results: list[RetrievalResult] = []
+    hop_summaries: list[str] = []
+    prior_context = ""
+
+    for step, sub_q in enumerate(sub_questions, 1):
+        # if we have findings from earlier hops, prepend them so the
+        # retrieval query is better grounded
+        search_query = sub_q
+        if prior_context:
+            search_query = f"{sub_q} (context: {prior_context})"
+
+        logger.info("Multi-hop step %d/%d: %s", step, len(sub_questions), sub_q)
+
+        try:
+            results = hybrid_retrieve(search_query, jurisdiction=jurisdiction)
+        except Exception as exc:
+            logger.warning("Retrieval failed on hop %d: %s", step, exc)
+            hop_summaries.append(f"Retrieval failed: {exc}")
+            continue
+
+        hop_chunks = [r.chunk for r in results]
+        all_results.extend(results)
+        all_chunks = _deduplicate_chunks(all_chunks + hop_chunks)
+
+        # produce an intermediate summary for this hop
+        summary = summarize_hop(sub_q, hop_chunks[:5])
+        hop_summaries.append(summary)
+        logger.info("Hop %d summary (%.60s...)", step, summary)
+
+        # carry this summary forward as context for the next hop
+        prior_context = summary
+
+    # final synthesis across all hops
+    # cap evidence chunks sent to the LLM to avoid blowing the context
+    evidence_chunks = all_chunks[:10]
+    answer = generate_multi_hop_answer(
+        query, sub_questions, hop_summaries, evidence_chunks, jurisdiction
+    )
+
+    citations = _extract_citations(answer, all_chunks)
+
+    return AgentResponse(
+        answer=answer,
+        citations=citations,
+        retrieved_chunks=all_results,
+        query_reformulations=[],
+        iterations_used=len(sub_questions),
+        is_multi_hop=True,
+        sub_questions=sub_questions,
+        hop_summaries=hop_summaries,
+    )
+
+
+def run(query: str, jurisdiction: str | None = None) -> AgentResponse:
+    """Execute the full agentic RAG pipeline.
+
+    Decides between single-hop and multi-hop based on query complexity:
+      - Single-hop: analyze -> retrieve -> answer -> self-reflect
+      - Multi-hop:  analyze -> decompose -> sequential retrieve per sub-question
+                    -> intermediate summaries -> final synthesis
+    """
+    query = query.strip()
+    if not query:
+        return AgentResponse(answer="Please provide a question.")
+
+    # -- 1. analyze --
+    analysis = analyze_query(query)
+    logger.info(
+        "Query analysis | intent=%s  jurisdiction=%s  refs=%s",
+        analysis["intent"], analysis["jurisdiction"], analysis["section_refs"],
+    )
+
+    if jurisdiction is None:
+        jurisdiction = analysis["jurisdiction"]
+
+    # -- 2. check if multi-hop is needed --
+    decomposition = decompose_query(query)
+    if decomposition["needs_multi_hop"]:
+        logger.info(
+            "Multi-hop activated — %d sub-questions: %s",
+            len(decomposition["sub_questions"]),
+            decomposition["sub_questions"],
+        )
+        return _run_multi_hop(query, decomposition["sub_questions"], jurisdiction)
+
+    # -- 3. single-hop path --
+    logger.info("Single-hop path")
+    return _run_single_hop(query, jurisdiction)

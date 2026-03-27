@@ -79,3 +79,6 @@ class AgentResponse:
     retrieved_chunks: list[RetrievalResult] = field(default_factory=list)
     query_reformulations: list[str] = field(default_factory=list)
     iterations_used: int = 1
+    is_multi_hop: bool = False
+    sub_questions: list[str] = field(default_factory=list)
+    hop_summaries: list[str] = field(default_factory=list)

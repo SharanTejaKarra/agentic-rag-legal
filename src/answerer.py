@@ -8,7 +8,7 @@ import time
 
 import requests
 
-from src.config import LLM_MAX_TOKENS, LLM_MODEL, LLM_TEMPERATURE, OLLAMA_BASE_URL
+from src.config import LLM_MAX_TOKENS, LLM_MODEL, LLM_TEMPERATURE, MAX_MULTI_HOP_STEPS, OLLAMA_BASE_URL
 from src.models import DocumentChunk
 
 logger = logging.getLogger(__name__)
@@ -188,3 +188,134 @@ def reformulate_query(original_query: str, context: str) -> str:
     if not reformulated:
         return original_query
     return reformulated
+
+
+# ── multi-hop: query decomposition ────────────────────────────────────
+
+SYSTEM_PROMPT_DECOMPOSE = """\
+You are a query planner for a legal document retrieval system.
+
+Given a user question, decide whether it can be answered by a single search or \
+needs to be broken into ordered sub-questions where each step builds on the previous.
+
+Respond with EXACTLY this JSON (no markdown fences, no explanation):
+{"needs_multi_hop": true/false, "sub_questions": ["q1", "q2", ...]}
+
+Rules:
+- If the question is straightforward (one topic, one jurisdiction, no cross-references), \
+set needs_multi_hop to false and sub_questions to an empty list.
+- If the question requires chaining information (e.g. find a rule, then find what \
+penalizes its violation; or compare provisions across jurisdictions), \
+set needs_multi_hop to true.
+- Order sub_questions so that earlier answers inform later searches.
+- Maximum """ + str(MAX_MULTI_HOP_STEPS) + """ sub-questions. Fewer is better."""
+
+
+def decompose_query(query: str) -> dict:
+    """Break a complex query into ordered sub-questions when needed.
+
+    Returns {"needs_multi_hop": bool, "sub_questions": list[str]}.
+    For simple queries, needs_multi_hop is False and the list is empty.
+    """
+    import json
+
+    logger.info("Checking if query needs multi-hop decomposition")
+    raw = _call_ollama(SYSTEM_PROMPT_DECOMPOSE, query)
+
+    try:
+        result = json.loads(raw)
+        needs = bool(result.get("needs_multi_hop", False))
+        subs = result.get("sub_questions", [])
+        # sanity: cap at MAX_MULTI_HOP_STEPS, discard empty strings
+        subs = [s.strip() for s in subs if s.strip()][:MAX_MULTI_HOP_STEPS]
+        if needs and len(subs) < 2:
+            # if the LLM says multi-hop but only gave 0-1 sub-questions, skip it
+            needs = False
+            subs = []
+        return {"needs_multi_hop": needs, "sub_questions": subs}
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("Could not parse decomposition response, treating as single-hop: %s", raw[:200])
+        return {"needs_multi_hop": False, "sub_questions": []}
+
+
+# ── multi-hop: intermediate summarization ─────────────────────────────
+
+SYSTEM_PROMPT_HOP_SUMMARY = """\
+You are a legal research assistant performing multi-step reasoning. \
+Given a sub-question and the retrieved legal excerpts, write a brief factual \
+summary that captures only the key information needed for the next step.
+
+Rules:
+- Stick strictly to what the excerpts say. No speculation.
+- Cite sections inline like [Section X.Y].
+- Keep it under 150 words — this is an intermediate step, not the final answer."""
+
+
+def summarize_hop(sub_question: str, chunks: list[DocumentChunk]) -> str:
+    """Produce a short intermediate summary for one hop of a multi-hop chain."""
+    if not chunks:
+        return "No relevant information found for this sub-question."
+
+    context_parts = []
+    for i, chunk in enumerate(chunks, 1):
+        header = f"[{i}] {chunk.section_id} | {chunk.title} | {chunk.jurisdiction}"
+        context_parts.append(f"{header}\n{chunk.text}")
+    context_block = "\n\n---\n\n".join(context_parts)
+
+    user_prompt = f"Sub-question: {sub_question}\n\nExcerpts:\n\n{context_block}"
+    return _call_ollama(SYSTEM_PROMPT_HOP_SUMMARY, user_prompt)
+
+
+# ── multi-hop: final synthesis ────────────────────────────────────────
+
+SYSTEM_PROMPT_MULTI_HOP = """\
+You are a legal research assistant. The user asked a complex question that was \
+broken into steps. You have intermediate findings from each step plus the \
+original legal excerpts.
+
+Synthesize a final answer that chains the findings together logically. \
+Cite every factual claim with [Source: <section_id>, <source_file>].
+
+Rules:
+- Only use information from the provided excerpts and intermediate findings.
+- Show how the pieces connect — that's the whole point of multi-hop reasoning.
+- If any step found no relevant information, acknowledge the gap.
+- Do not speculate beyond what the sources say."""
+
+
+def generate_multi_hop_answer(
+    original_query: str,
+    sub_questions: list[str],
+    hop_summaries: list[str],
+    all_chunks: list[DocumentChunk],
+    jurisdiction: str | None = None,
+) -> str:
+    """Final synthesis across all hops for a multi-hop query."""
+    # build the chain-of-findings block
+    chain_parts = []
+    for i, (sq, summary) in enumerate(zip(sub_questions, hop_summaries), 1):
+        chain_parts.append(f"Step {i}: {sq}\nFindings: {summary}")
+    chain_block = "\n\n".join(chain_parts)
+
+    # build the evidence block from all accumulated chunks
+    evidence_parts = []
+    for i, chunk in enumerate(all_chunks, 1):
+        header = (
+            f"[{i}] Section: {chunk.section_id} | Title: {chunk.title} | "
+            f"Jurisdiction: {chunk.jurisdiction} | File: {chunk.source_file}"
+        )
+        evidence_parts.append(f"{header}\n{chunk.text}")
+    evidence_block = "\n\n---\n\n".join(evidence_parts)
+
+    jurisdiction_note = ""
+    if jurisdiction:
+        jurisdiction_note = f"\nFocus on {jurisdiction.title()} law where relevant."
+
+    user_prompt = (
+        f"Chain of findings:\n\n{chain_block}\n\n"
+        f"===\n\nFull legal excerpts:\n\n{evidence_block}\n\n---\n\n"
+        f"Original question: {original_query}{jurisdiction_note}"
+    )
+
+    logger.info("Generating multi-hop synthesis for: %.80s...", original_query)
+    return _call_ollama(SYSTEM_PROMPT_MULTI_HOP, user_prompt)
